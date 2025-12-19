@@ -1,0 +1,250 @@
+// ==UserScript==
+// @name         Canvas Pages: Search Bar Filter
+// @namespace    https://tampermonkey.net/
+// @version      1.0.2
+// @description  Adds a search bar to the Canvas Pages index page to filter page rows as you type.
+// @match        *://*/courses/*/pages
+// @match        *://*/courses/*/pages?*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(() => {
+  "use strict";
+
+  const HOST_ID = "tm-pages-search-host";
+  const STYLE_ID = "tm-pages-search-style";
+  const DEBOUNCE_MS = 80;
+
+  let lastQuery = "";
+  let observer = null;
+  let debounceTimer = null;
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function isPagesIndex() {
+    const p = location.pathname;
+    return /\/courses\/\d+\/pages\/?$/.test(p) || /\/courses\/\d+\/pages$/.test(p);
+  }
+
+  function findPagesTable() {
+    const tables = Array.from(document.querySelectorAll("table"));
+    for (const t of tables) {
+      const thText = Array.from(t.querySelectorAll("thead th"))
+        .map((th) => (th.textContent || "").trim().toLowerCase())
+        .filter(Boolean);
+
+      const hasPageTitle = thText.some((x) => x.includes("page title") || x === "title");
+      const hasCreation = thText.some((x) => x.includes("creation") || x.includes("created"));
+      if (hasPageTitle && hasCreation) return t;
+    }
+
+    return (
+      document.querySelector('[data-testid*="pages"] table') ||
+      document.querySelector("#content table") ||
+      document.querySelector(".ic-Layout-contentMain table") ||
+      null
+    );
+  }
+
+  function getRowText(tr) {
+    return (tr.innerText || tr.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+  }
+
+  function getBodyRows(table) {
+    const tbody = table.tBodies && table.tBodies[0];
+    if (!tbody) return [];
+    return Array.from(tbody.querySelectorAll("tr")).filter((tr) => tr.querySelectorAll("td").length > 0);
+  }
+
+  function applyFilter(table, query) {
+    const q = (query || "").trim().toLowerCase();
+    lastQuery = q;
+
+    const rows = getBodyRows(table);
+    const total = rows.length;
+    let shown = 0;
+
+    for (const tr of rows) {
+      const text = getRowText(tr);
+      const match = !q || text.includes(q);
+      tr.style.display = match ? "" : "none";
+      if (match) shown++;
+    }
+
+    const host = document.getElementById(HOST_ID);
+    if (host && host.shadowRoot) {
+      const countEl = host.shadowRoot.getElementById("tmCount");
+      if (countEl) countEl.textContent = `${shown} / ${total} shown`;
+
+      const emptyEl = host.shadowRoot.getElementById("tmEmpty");
+      if (emptyEl) emptyEl.style.display = shown === 0 ? "block" : "none";
+    }
+  }
+
+  function mountUI(table) {
+    if (document.getElementById(HOST_ID)) return;
+
+    const host = document.createElement("div");
+    host.id = HOST_ID;
+
+    const shadow = host.attachShadow({ mode: "open" });
+
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = `
+      :host{
+        display:block;
+        width: 50%;
+        min-width: 360px;
+        max-width: 640px;
+      }
+      @media (max-width: 900px){
+        :host{ width: 100%; min-width: 0; max-width: 100%; }
+      }
+
+      .wrap{
+        display:flex;
+        align-items:center;
+        gap:10px;
+        padding:10px 12px;
+        border:1px solid rgba(0,0,0,.12);
+        border-radius:10px;
+        background:#fff;
+        margin: 0 0 12px 0;
+      }
+      .row{
+        display:flex;
+        align-items:center;
+        gap:8px;
+        flex: 1;
+      }
+      input[type="search"]{
+        width:100%;
+        padding:8px 10px;
+        border:1px solid rgba(0,0,0,.2);
+        border-radius:8px;
+        font-size:14px;
+        outline:none;
+      }
+      input[type="search"]:focus{
+        border-color: rgba(0,0,0,.45);
+      }
+      button{
+        padding:8px 10px;
+        border:1px solid rgba(0,0,0,.2);
+        border-radius:8px;
+        background:#f7f7f7;
+        cursor:pointer;
+        font-size:13px;
+        white-space:nowrap;
+      }
+      button:hover{ background:#efefef; }
+      .meta{
+        display:flex;
+        align-items:center;
+        gap:10px;
+        font-size:12px;
+        opacity:.8;
+        white-space:nowrap;
+      }
+      .empty{
+        display:none;
+        margin-top:8px;
+        padding:10px 12px;
+        border:1px dashed rgba(0,0,0,.25);
+        border-radius:10px;
+        background:#fff;
+        font-size:13px;
+      }
+    `;
+
+    const wrap = document.createElement("div");
+    wrap.className = "wrap";
+    wrap.innerHTML = `
+      <div class="row">
+        <input id="tmSearch" type="search" />
+        <button id="tmClear" type="button" title="Clear (Esc)">Clear</button>
+      </div>
+      <div class="meta">
+        <span id="tmCount">—</span>
+      </div>
+    `;
+
+    const empty = document.createElement("div");
+    empty.id = "tmEmpty";
+    empty.className = "empty";
+    empty.textContent = "No pages match your search.";
+
+    shadow.appendChild(style);
+    shadow.appendChild(wrap);
+    shadow.appendChild(empty);
+
+    const insertTarget = table.closest("div") || table.parentElement;
+    insertTarget.parentElement.insertBefore(host, insertTarget);
+
+    const input = shadow.getElementById("tmSearch");
+    const clearBtn = shadow.getElementById("tmClear");
+
+    const doApply = () => applyFilter(table, input.value);
+
+    input.addEventListener("input", () => {
+      window.clearTimeout(debounceTimer);
+      debounceTimer = window.setTimeout(doApply, DEBOUNCE_MS);
+    });
+
+    clearBtn.addEventListener("click", () => {
+      input.value = "";
+      input.focus();
+      applyFilter(table, "");
+    });
+
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        input.value = "";
+        applyFilter(table, "");
+      }
+    });
+
+    applyFilter(table, "");
+  }
+
+  function attachObserver(table) {
+    if (observer) observer.disconnect();
+    observer = new MutationObserver(() => applyFilter(table, lastQuery));
+    observer.observe(table, { childList: true, subtree: true });
+  }
+
+  async function init() {
+    if (!isPagesIndex()) return;
+
+    for (let i = 0; i < 40; i++) {
+      const table = findPagesTable();
+      if (table) {
+        mountUI(table);
+        attachObserver(table);
+
+        const root = document.querySelector("#content, .ic-Layout-contentMain, body") || document.body;
+        const outerObserver = new MutationObserver(() => {
+          const t2 = findPagesTable();
+          if (t2 && t2 !== table) {
+            const oldHost = document.getElementById(HOST_ID);
+            if (oldHost) oldHost.remove();
+            mountUI(t2);
+            attachObserver(t2);
+            applyFilter(t2, lastQuery);
+          }
+        });
+        outerObserver.observe(root, { childList: true, subtree: true });
+
+        return;
+      }
+      await sleep(250);
+    }
+
+    console.warn("[Canvas Pages Search] Could not find the Pages table.");
+  }
+
+  init();
+})();
